@@ -3,6 +3,8 @@ import fetch from "node-fetch";
 import pdf from "pdf-parse";
 import { XMLBuilder } from "fast-xml-parser";
 import cors from "cors";
+import { createCanvas } from "canvas";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
@@ -31,87 +33,141 @@ function parseMeta(text) {
   };
 }
 
-// Mappa livello → emoji
+// Renderizza pagina PDF in canvas
+async function renderPageToCanvas(pdfBuffer, pageNumber = 1) {
+  const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer });
+  const pdfDoc = await loadingTask.promise;
+  const page = await pdfDoc.getPage(pageNumber);
+
+  const viewport = page.getViewport({ scale: 2.0 });
+  const canvas = createCanvas(viewport.width, viewport.height);
+  const context = canvas.getContext("2d");
+
+  await page.render({ canvasContext: context, viewport }).promise;
+  return { canvas, context, viewport };
+}
+
+// Legge colore pixel
+function getPixelColor(context, x, y) {
+  const data = context.getImageData(x, y, 1, 1).data;
+  const [r, g, b, a] = data;
+  return { r, g, b, a };
+}
+
+// Mappa RGB → livello
+function rgbToLevel({ r, g, b }) {
+  // TODO: tarare su PDF reali
+  if (r > 240 && g > 240 && b > 240) return null; // bianco
+  // giallo
+  if (r > 230 && g > 230 && b < 150) return "GIALLO";
+  // arancione
+  if (r > 230 && g < 200 && b < 120) return "ARANCIONE";
+  // rosso (se mai usato)
+  if (r > 200 && g < 100 && b < 100) return "ROSSO";
+  return null;
+}
+
 function livelloEmoji(livello) {
-  if (/GIALLO/i.test(livello)) return "🟡";
-  if (/ARANCIONE/i.test(livello)) return "🟠";
-  if (/ROSSO/i.test(livello)) return "🔴";
+  if (livello === "GIALLO") return "🟡";
+  if (livello === "ARANCIONE") return "🟠";
+  if (livello === "ROSSO") return "🔴";
   return "⚪";
 }
 
-// Estrae blocchi per zona dal testo (best effort)
-function extractZonesFromText(text) {
-  const clean = text.replace(/\r/g, "");
-  const lines = clean.split("\n").map(l => l.trim()).filter(Boolean);
+// Configurazione zone / rischi / colonne (da tarare)
+const ZONES = [
+  { nome: "Iglesiente", code: "SARD-A", yBase: 520 },
+  { nome: "Campidano", code: "SARD-B", yBase: 600 },
+  { nome: "Montevecchio Pischinappiu", code: "SARD-C", yBase: 680 },
+  { nome: "Flumendosa Flumineddu", code: "SARD-D", yBase: 760 },
+  { nome: "Tirso", code: "SARD-E", yBase: 840 },
+  { nome: "Gallura", code: "SARD-F", yBase: 920 },
+  { nome: "Logudoro", code: "SARD-G", yBase: 1000 }
+];
 
-  const zoneNames = [
-    "Iglesiente",
-    "Campidano",
-    "Montevecchio Pischinappiu",
-    "Flumendosa Flumineddu",
-    "Tirso",
-    "Gallura",
-    "Logudoro"
-  ];
+const RISKS = [
+  { tipo: "Idrogeologico", yOffset: 0 },
+  { tipo: "Idraulico", yOffset: 20 },
+  { tipo: "Temporali", yOffset: 40 },
+  { tipo: "Neve", yOffset: 60 }
+];
 
-  const zones = [];
+// Colonne orarie (x da tarare)
+const COLS = [
+  // Gio 05.03.2026
+  { label: "Gio, 05.03.2026 dalle ore 14.00 alle ore 18.00", x: 700 },
+  { label: "Gio, 05.03.2026 dalle ore 18.00 alle ore 21.00", x: 760 },
+  // Ven 06.03.2026
+  { label: "Ven, 06.03.2026 dalle ore 00.00 alle ore 03.00", x: 820 },
+  { label: "Ven, 06.03.2026 dalle ore 03.00 alle ore 06.00", x: 880 },
+  { label: "Ven, 06.03.2026 dalle ore 06.00 alle ore 09.00", x: 940 },
+  { label: "Ven, 06.03.2026 dalle ore 09.00 alle ore 12.00", x: 1000 },
+  { label: "Ven, 06.03.2026 dalle ore 12.00 alle ore 15.00", x: 1060 },
+  { label: "Ven, 06.03.2026 dalle ore 15.00 alle ore 18.00", x: 1120 },
+  { label: "Ven, 06.03.2026 dalle ore 18.00 alle ore 21.00", x: 1180 },
+  // Sab 07.03.2026 Tendenza
+  { label: "Sab, 07.03.2026 (Tendenza)", x: 1240 }
+];
 
-  zoneNames.forEach(zona => {
-    // Trova righe che contengono il nome zona
-    const zoneLines = lines.filter(l => l.toLowerCase().includes(zona.toLowerCase()));
-    if (zoneLines.length === 0) return;
+// Estrae livelli per zona/rischio/fascia
+async function extractZoneLevelsFromPdf(pdfBuffer) {
+  const { context } = await renderPageToCanvas(pdfBuffer, 1); // pagina con tabella
 
-    // Per semplicità, prendiamo un intorno di righe
-    const indices = lines
-      .map((l, i) => ({ l, i }))
-      .filter(o => o.l.toLowerCase().includes(zona.toLowerCase()))
-      .map(o => o.i);
+  const zoneData = [];
 
-    const blocco = [];
-    indices.forEach(idx => {
-      for (let i = Math.max(0, idx - 10); i <= Math.min(lines.length - 1, idx + 20); i++) {
-        blocco.push(lines[i]);
-      }
-    });
+  for (const z of ZONES) {
+    const rischiOut = [];
 
-    const bloccoText = [...new Set(blocco)].join(" ");
-
-    // Estrai rischi, livelli, fasce
-    const rischi = [];
-
-    // Pattern tipo: "Rischio: Idrogeologico" + "Livello: Giallo (Ordinaria criticità)" + fasce
-    const rischioRegex = /Rischio[: ]+([A-Za-zàèéìòùÀÈÉÌÒÙ ]+).*?Livello[: ]+([A-Za-zàèéìòùÀÈÉÌÒÙ ()]+)(.*?)(?=Rischio[: ]+|$)/gi;
-    let m;
-    while ((m = rischioRegex.exec(bloccoText)) !== null) {
-      const tipo = m[1].trim();
-      const livello_label = m[2].trim();
-      const resto = m[3] || "";
-
+    for (const r of RISKS) {
       const fasce = [];
-      const fasciaRegex = /(?:Gio|Ven|Sab|Dom|Lun|Mar|Mer)[^,]*,\s*\d{2}.\d{2}.\d{4}[^0-9]*\d{2}.\d{2}[^0-9]*\d{2}.\d{2}/gi;
-      let f;
-      while ((f = fasciaRegex.exec(resto)) !== null) {
-        fasce.push(f[0].replace(/\s+/g, " ").trim());
+
+      for (const c of COLS) {
+        const x = c.x;
+        const y = z.yBase + r.yOffset; // TODO: tarare yBase/yOffset
+
+        const color = getPixelColor(context, x, y);
+        const livello = rgbToLevel(color);
+        if (livello) {
+          fasce.push({
+            label: c.label,
+            livello
+          });
+        }
       }
 
-      rischi.push({
-        tipo,
-        livello: livello_label.toUpperCase().includes("ARANCIONE")
-          ? "ARANCIONE"
-          : livello_label.toUpperCase().includes("ROSSO")
+      if (fasce.length > 0) {
+        // livello massimo tra le fasce
+        const maxLevel = fasce.some(f => f.livello === "ROSSO")
           ? "ROSSO"
-          : "GIALLO",
-        livello_label,
-        fasce
+          : fasce.some(f => f.livello === "ARANCIONE")
+          ? "ARANCIONE"
+          : "GIALLO";
+
+        const livello_label =
+          maxLevel === "ROSSO"
+            ? "Rosso (Elevata criticità)"
+            : maxLevel === "ARANCIONE"
+            ? "Arancione (Moderata criticità)"
+            : "Giallo (Ordinaria criticità)";
+
+        rischiOut.push({
+          tipo: r.tipo,
+          livello: maxLevel,
+          livello_label,
+          fasce: fasce.map(f => f.label)
+        });
+      }
+    }
+
+    if (rischiOut.length > 0) {
+      zoneData.push({
+        zona: z.nome,
+        rischi: rischiOut
       });
     }
+  }
 
-    if (rischi.length > 0) {
-      zones.push({ zona, rischi });
-    }
-  });
-
-  return zones;
+  return zoneData;
 }
 
 // Costruisce RSS
@@ -167,7 +223,7 @@ app.post("/extract", async (req, res) => {
     const pdfData = await pdf(pdfBuffer);
 
     const meta = parseMeta(pdfData.text);
-    const zoneData = extractZonesFromText(pdfData.text);
+    const zoneData = await extractZoneLevelsFromPdf(pdfBuffer);
 
     const rssXml = buildRss(meta, zoneData);
 
