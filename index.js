@@ -8,75 +8,174 @@ const app = express();
 app.use(express.json({ limit: "20mb" }));
 app.use(cors());
 
-// Scarica URL (RSS o PDF)
+// Scarica PDF
 async function download(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error("Errore download: " + res.status);
   return Buffer.from(await res.arrayBuffer());
 }
 
-// Estrazione dati dal testo
-function parseText(text) {
+// Metadati generali
+function parseMeta(text) {
   const clean = text.replace(/\s+/g, " ");
 
-  const titleMatch = clean.match(/AVVISO DI CRITICIT[AÀ].*?REGIONALE/i);
+  const titleMatch = clean.match(/AVVISO DI CRITICIT[AÀ].*?(?=Zona|Validit[aà]|Data di emissione|Prot\.|IL DIRETTORE)/i);
   const inizioMatch = clean.match(/Inizio validit[aà].*?(\d{2}.\d{2}.\d{4} \d{2}:\d{2})/i);
   const fineMatch = clean.match(/Fine validit[aà].*?(\d{2}.\d{2}.\d{4} \d{2}:\d{2})/i);
 
-  const zone = [...clean.matchAll(/Iglesiente|Campidano|Montevecchio|Flumendosa|Tirso|Gallura|Logudoro/gi)]
-    .map(z => z[0]);
-
   return {
-    title: titleMatch?.[0] ?? "",
-    inizio: inizioMatch?.[1] ?? "",
-    fine: fineMatch?.[1] ?? "",
-    zone: [...new Set(zone)]
+    titolo: titleMatch?.[0]?.trim() || "AVVISO DI CRITICITÀ PER RISCHIO IDROGEOLOGICO E IDRAULICO",
+    inizio_validita: inizioMatch?.[1] || "",
+    fine_validita: fineMatch?.[1] || "",
+    pubDate: new Date().toUTCString()
   };
 }
 
-// Estrae link PDF da RSS
-async function extractPdfFromRss(rssUrl) {
-  const xmlText = await (await fetch(rssUrl)).text();
-  const match = xmlText.match(/<link>(.*?)<\/link>/i);
-  return match ? match[1] : null;
+// Mappa livello → emoji
+function livelloEmoji(livello) {
+  if (/GIALLO/i.test(livello)) return "🟡";
+  if (/ARANCIONE/i.test(livello)) return "🟠";
+  if (/ROSSO/i.test(livello)) return "🔴";
+  return "⚪";
+}
+
+// Estrae blocchi per zona dal testo (best effort)
+function extractZonesFromText(text) {
+  const clean = text.replace(/\r/g, "");
+  const lines = clean.split("\n").map(l => l.trim()).filter(Boolean);
+
+  const zoneNames = [
+    "Iglesiente",
+    "Campidano",
+    "Montevecchio Pischinappiu",
+    "Flumendosa Flumineddu",
+    "Tirso",
+    "Gallura",
+    "Logudoro"
+  ];
+
+  const zones = [];
+
+  zoneNames.forEach(zona => {
+    // Trova righe che contengono il nome zona
+    const zoneLines = lines.filter(l => l.toLowerCase().includes(zona.toLowerCase()));
+    if (zoneLines.length === 0) return;
+
+    // Per semplicità, prendiamo un intorno di righe
+    const indices = lines
+      .map((l, i) => ({ l, i }))
+      .filter(o => o.l.toLowerCase().includes(zona.toLowerCase()))
+      .map(o => o.i);
+
+    const blocco = [];
+    indices.forEach(idx => {
+      for (let i = Math.max(0, idx - 10); i <= Math.min(lines.length - 1, idx + 20); i++) {
+        blocco.push(lines[i]);
+      }
+    });
+
+    const bloccoText = [...new Set(blocco)].join(" ");
+
+    // Estrai rischi, livelli, fasce
+    const rischi = [];
+
+    // Pattern tipo: "Rischio: Idrogeologico" + "Livello: Giallo (Ordinaria criticità)" + fasce
+    const rischioRegex = /Rischio[: ]+([A-Za-zàèéìòùÀÈÉÌÒÙ ]+).*?Livello[: ]+([A-Za-zàèéìòùÀÈÉÌÒÙ ()]+)(.*?)(?=Rischio[: ]+|$)/gi;
+    let m;
+    while ((m = rischioRegex.exec(bloccoText)) !== null) {
+      const tipo = m[1].trim();
+      const livello_label = m[2].trim();
+      const resto = m[3] || "";
+
+      const fasce = [];
+      const fasciaRegex = /(?:Gio|Ven|Sab|Dom|Lun|Mar|Mer)[^,]*,\s*\d{2}.\d{2}.\d{4}[^0-9]*\d{2}.\d{2}[^0-9]*\d{2}.\d{2}/gi;
+      let f;
+      while ((f = fasciaRegex.exec(resto)) !== null) {
+        fasce.push(f[0].replace(/\s+/g, " ").trim());
+      }
+
+      rischi.push({
+        tipo,
+        livello: livello_label.toUpperCase().includes("ARANCIONE")
+          ? "ARANCIONE"
+          : livello_label.toUpperCase().includes("ROSSO")
+          ? "ROSSO"
+          : "GIALLO",
+        livello_label,
+        fasce
+      });
+    }
+
+    if (rischi.length > 0) {
+      zones.push({ zona, rischi });
+    }
+  });
+
+  return zones;
+}
+
+// Costruisce RSS
+function buildRss(meta, zoneData) {
+  const items = zoneData.map(z => {
+    let desc = `${meta.titolo} Zona ${z.zona} Validità bollettino: dal ${meta.inizio_validita} al ${meta.fine_validita} `;
+
+    z.rischi.forEach(r => {
+      desc += `⚠️ Rischio: ${r.tipo} ${livelloEmoji(r.livello)} Livello: ${r.livello_label} Fasce orarie: `;
+      if (r.fasce.length === 0) {
+        desc += "- (non specificate) ";
+      } else {
+        r.fasce.forEach(f => {
+          desc += `- 🗓️⏰ ${f} `;
+        });
+      }
+    });
+
+    return {
+      title: { "#text": `Allerta Zona: ${z.zona}` },
+      pubDate: meta.pubDate,
+      category: { "#text": z.zona },
+      description: { "#text": desc.trim() }
+    };
+  });
+
+  const rssObj = {
+    rss: {
+      "@_version": "2.0",
+      channel: {
+        title: "Allerte Protezione Civile Sardegna",
+        description: { "#text": meta.titolo },
+        item: items
+      }
+    }
+  };
+
+  const builder = new XMLBuilder({
+    ignoreAttributes: false,
+    format: true
+  });
+
+  return builder.build(rssObj);
 }
 
 // API principale
 app.post("/extract", async (req, res) => {
   try {
-    let { url } = req.body;
+    const { url } = req.body;
     if (!url) return res.status(400).json({ error: "Missing URL" });
 
-    // Se è RSS → estrai PDF
-    if (url.endsWith(".xml")) {
-      const pdfUrl = await extractPdfFromRss(url);
-      if (!pdfUrl) throw new Error("Nessun PDF trovato nel feed RSS");
-      url = pdfUrl;
-    }
-
-    // Scarica PDF
     const pdfBuffer = await download(url);
-
-    // Estrai testo
     const pdfData = await pdf(pdfBuffer);
-    const parsed = parseText(pdfData.text);
 
-    // Genera XML
-    const builder = new XMLBuilder({ ignoreAttributes: false, format: true });
-    const xml = builder.build({
-      allerta: {
-        titolo: parsed.title,
-        inizio_validita: parsed.inizio,
-        fine_validita: parsed.fine,
-        zone: { zona: parsed.zone }
-      }
-    });
+    const meta = parseMeta(pdfData.text);
+    const zoneData = extractZonesFromText(pdfData.text);
+
+    const rssXml = buildRss(meta, zoneData);
 
     res.json({
       success: true,
-      xml,
-      parsed,
-      pdf_url: url
+      rss: rssXml,
+      meta,
+      zoneData
     });
 
   } catch (err) {
